@@ -12,3 +12,4 @@ Unfortunately, the game has some issues:
 - **Learning Algorithm:** The AI does not seem to be learning effectively. The Q-learning model isn't improving as expected, which means the AI's driving skills aren't getting better over time.
 - **Sensors:** The sensors designed to detect collisions and track boundaries aren't functioning as intended. This impacts the AI's ability to navigate the track correctly.
 
+
