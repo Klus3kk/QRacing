@@ -1,4 +1,4 @@
-# QRacing (Failed Version)
+# QRacing
 
 **QRacing** is a 2D racing game designed to teach an AI how to navigate a track as quickly as possible. Developed using the Pygame library, the game features a simple racing environment where the objective is to reach the finish line as efficiently as possible.
 
