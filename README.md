@@ -13,3 +13,4 @@ Unfortunately, the game has some issues:
 - **Sensors:** The sensors designed to detect collisions and track boundaries aren't functioning as intended. This impacts the AI's ability to navigate the track correctly.
 
 
+
