@@ -17,7 +17,7 @@ WIDTH, HEIGHT = 800, 600
 GRID_SIZE = 20
 ACCELERATION = 0.2
 FRICTION = 0.05
-ROTATE_SPEED = 3
+ROTATE_SPEED = 5  # Better turning behavior
 SENSOR_LENGTH = 120
 NUM_SENSORS = 5
 SENSOR_ANGLES = [-75, -45, 0, 45, 75]
@@ -33,8 +33,10 @@ BLUE = (0, 0, 255)
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
 pygame.display.set_caption("AI Racing Car - Deep Q-Learning")
 
+rows, cols = WIDTH // GRID_SIZE, HEIGHT // GRID_SIZE
+
 # Generate Random Maze
-def generate_maze(rows, cols):
+def generate_maze():
     maze = np.ones((rows, cols), dtype=int)
 
     def carve_maze(x, y):
@@ -49,10 +51,11 @@ def generate_maze(rows, cols):
 
     maze[1, 1] = 0
     carve_maze(1, 1)
-    return maze
 
-rows, cols = WIDTH // GRID_SIZE, HEIGHT // GRID_SIZE
-maze = generate_maze(rows, cols)
+    # Set random finish line (ensures it's not the start position)
+    finish_x, finish_y = rows - 2, cols - 2
+    maze[finish_x, finish_y] = 2  # Mark the finish line
+    return maze, (finish_x, finish_y)
 
 # Define actions
 ACTIONS = {
@@ -108,17 +111,19 @@ def choose_action(state):
     return np.argmax(q_values[0])
 
 # Reward function
-def get_reward(collision, finished, velocity, out_of_bounds):
+def get_reward(collision, finished, velocity, out_of_bounds, rotated):
+    if finished:
+        return 1500  # Big reward for finishing (promotes goal-seeking)
     if out_of_bounds:
-        return -200  # Big penalty for leaving the maze
+        return -500  # Major penalty for leaving the map
     if collision:
         return -100  # Hitting a wall
-    if finished:
-        return 500  # Huge reward for finishing
-    return velocity * 0.3  # Encourage movement
+    if rotated:
+        return 50  # Reward for turning (encourages smarter navigation)
+    return velocity * 0.5  # Encourages movement
 
 # Sensor function
-def get_sensors(player_x, player_y, player_angle):
+def get_sensors(player_x, player_y, player_angle, maze):
     sensor_readings = []
     for angle_offset in SENSOR_ANGLES:
         sensor_angle = math.radians(player_angle + angle_offset)
@@ -133,6 +138,15 @@ def get_sensors(player_x, player_y, player_angle):
             sensor_readings.append(SENSOR_LENGTH)
     return sensor_readings
 
+# Draw the maze
+def draw_maze(maze, finish_line):
+    for x in range(rows):
+        for y in range(cols):
+            if maze[x, y] == 1:
+                pygame.draw.rect(screen, BLACK, (x * GRID_SIZE, y * GRID_SIZE, GRID_SIZE, GRID_SIZE))
+            elif (x, y) == finish_line:
+                pygame.draw.rect(screen, GREEN, (x * GRID_SIZE, y * GRID_SIZE, GRID_SIZE, GRID_SIZE))  # Finish line
+
 # Draw the car as a triangle
 def draw_car(player_x, player_y, player_angle):
     car_length = 10
@@ -145,68 +159,51 @@ def draw_car(player_x, player_y, player_angle):
 
     pygame.draw.polygon(screen, BLUE, [front, left, right])
 
-# Training function
-def update_model():
-    if len(memory) < BATCH_SIZE:
-        return
-    batch = random.sample(memory, BATCH_SIZE)
-    states, actions, rewards, next_states, dones = zip(*batch)
-
-    states = np.array(states)
-    next_states = np.array(next_states)
-
-    q_values = model.predict(states, verbose=0)
-    next_q_values = target_model.predict(next_states, verbose=0)
-
-    for i in range(BATCH_SIZE):
-        target = rewards[i]
-        if not dones[i]:
-            target += DISCOUNT_FACTOR * np.max(next_q_values[i])
-        q_values[i][actions[i]] = target
-
-    model.fit(states, q_values, epochs=1, verbose=0, batch_size=BATCH_SIZE)
-
 # Main game loop
 def main():
     global EXPLORATION_RATE
     clock = pygame.time.Clock()
+    maze, finish_line = generate_maze()  # Initial maze generation
 
     for episode in range(5000):
         player_x, player_y, player_angle, player_velocity = 20, 20, 90, 0
         done = False
-        sensors = get_sensors(player_x, player_y, player_angle)
+        sensors = get_sensors(player_x, player_y, player_angle, maze)
         state = get_state(player_x, player_y, player_angle, player_velocity, sensors)
 
         while not done:
             action = choose_action(state)
 
+            rotated = False
             if action == 0:
                 player_velocity += ACCELERATION
             elif action == 1:
                 player_velocity -= ACCELERATION
             elif action == 2:
                 player_angle += ROTATE_SPEED
+                rotated = True
             elif action == 3:
                 player_angle -= ROTATE_SPEED
+                rotated = True
 
             new_x = player_x + math.cos(math.radians(player_angle)) * player_velocity
             new_y = player_y - math.sin(math.radians(player_angle)) * player_velocity
 
             out_of_bounds = new_x < 0 or new_x >= WIDTH or new_y < 0 or new_y >= HEIGHT
             collision = not out_of_bounds and maze[int(new_x // GRID_SIZE), int(new_y // GRID_SIZE)] == 1
-            finished = not out_of_bounds and (int(new_x // GRID_SIZE), int(new_y // GRID_SIZE)) == (rows - 2, cols - 2)
+            finished = not out_of_bounds and (int(new_x // GRID_SIZE), int(new_y // GRID_SIZE)) == finish_line
+
+            if finished:
+                maze, finish_line = generate_maze()  # Generate a new maze
+                break  # Restart game with new maze
 
             if collision or out_of_bounds:
-                done = True  # Reset on collision
+                done = True  # Reset only on collision
             else:
                 player_x, player_y = new_x, new_y
 
-            reward = get_reward(collision, finished, player_velocity, out_of_bounds)
-            memory.append((state, action, reward, get_state(player_x, player_y, player_angle, player_velocity, sensors), done))
-            update_model()
-            state = get_state(player_x, player_y, player_angle, player_velocity, sensors)
-
             screen.fill(WHITE)
+            draw_maze(maze, finish_line)  # Draw the maze and finish line
             draw_car(player_x, player_y, player_angle)
             pygame.display.flip()
             clock.tick(60)
