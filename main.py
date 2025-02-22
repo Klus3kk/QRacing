@@ -3,219 +3,213 @@ import sys
 import math
 import random
 import numpy as np
+import tensorflow as tf
+from collections import deque
+
+# Force TensorFlow to use CPU to avoid CUDA errors
+tf.config.set_visible_devices([], "GPU")
 
 # Initialize Pygame
 pygame.init()
 
 # Constants
 WIDTH, HEIGHT = 800, 600
-FPS = 60
+GRID_SIZE = 20
 ACCELERATION = 0.2
 FRICTION = 0.05
-ROTATE_SPEED = 5
-SENSOR_LENGTH = 100  # Length of the sensors
+ROTATE_SPEED = 3
+SENSOR_LENGTH = 120
+NUM_SENSORS = 5
+SENSOR_ANGLES = [-75, -45, 0, 45, 75]
 
 # Colors
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 RED = (255, 0, 0)
 GREEN = (0, 255, 0)
+BLUE = (0, 0, 255)
 
-# Setup the display
+# Setup display
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("2D Racing Game with Q-learning")
+pygame.display.set_caption("AI Racing Car - Deep Q-Learning")
 
-# Load assets with error handling
-try:
-    player_car = pygame.image.load('Race_Car.png').convert_alpha()
-    map1 = pygame.image.load('Map1.png').convert_alpha()
-except pygame.error as e:
-    print(f"Failed to load assets: {e}")
-    pygame.quit()
-    sys.exit()
+# Generate Random Maze
+def generate_maze(rows, cols):
+    maze = np.ones((rows, cols), dtype=int)
 
-# Resize assets
-CAR_WIDTH, CAR_HEIGHT = 40, 20
-player_car = pygame.transform.scale(player_car, (CAR_WIDTH, CAR_HEIGHT))
-MAP_WIDTH, MAP_HEIGHT = 500, 500
-map1 = pygame.transform.scale(map1, (MAP_WIDTH, MAP_HEIGHT))
+    def carve_maze(x, y):
+        directions = [(0, 2), (0, -2), (2, 0), (-2, 0)]
+        random.shuffle(directions)
+        for dx, dy in directions:
+            nx, ny = x + dx, y + dy
+            if 0 < nx < rows and 0 < ny < cols and maze[nx, ny] == 1:
+                maze[x + dx // 2, y + dy // 2] = 0
+                maze[nx, ny] = 0
+                carve_maze(nx, ny)
 
-# Create masks for pixel-perfect collision detection
-car_mask = pygame.mask.from_surface(player_car)
-map_mask = pygame.mask.from_surface(map1)
+    maze[1, 1] = 0
+    carve_maze(1, 1)
+    return maze
 
-# Create game objects
-player_rect = player_car.get_rect(center=(WIDTH // 2, HEIGHT // 2))
-map1_rect = map1.get_rect(center=(WIDTH // 2, HEIGHT // 2))
-
-# Create finish line
-finish_line = pygame.Rect(561, 68, 82, 40)
-
-# Q-learning parameters
-LEARNING_RATE = 0.1
-DISCOUNT_FACTOR = 0.9
-EXPLORATION_RATE = 1.0
-EXPLORATION_DECAY = 0.995
-MIN_EXPLORATION_RATE = 0.01
-
-# Initialize Q-table
-states = (WIDTH // 10, HEIGHT // 10, 36, 20)
-q_table = np.zeros(states + (5,))  # 5 possible actions
+rows, cols = WIDTH // GRID_SIZE, HEIGHT // GRID_SIZE
+maze = generate_maze(rows, cols)
 
 # Define actions
 ACTIONS = {
     0: "accelerate",
-    1: "turn_left",
-    2: "turn_right",
+    1: "brake",
+    2: "turn_left",
+    3: "turn_right",
+    4: "no_action"
 }
 
-def get_state(player_x, player_y, player_angle, player_velocity):
-    x_state = int(player_x // 10)
-    y_state = int(player_y // 10)
-    angle_state = int(player_angle // 10) % 36  # Wrap around at 360 degrees
-    velocity_state = int(player_velocity // 1) % 20  # Cap the velocity state
-    return (x_state, y_state, angle_state, velocity_state)
+# Deep Q-Network parameters
+LEARNING_RATE = 0.001
+DISCOUNT_FACTOR = 0.9
+EXPLORATION_RATE = 1.0
+EXPLORATION_DECAY = 0.995
+MIN_EXPLORATION_RATE = 0.01
+BATCH_SIZE = 64
+MEMORY_SIZE = 50000
+UPDATE_TARGET_EVERY = 50
 
+# Replay memory
+memory = deque(maxlen=MEMORY_SIZE)
+
+# Build Deep Q-Network
+def build_model():
+    model = tf.keras.models.Sequential([
+        tf.keras.layers.Input(shape=(9,)),
+        tf.keras.layers.Dense(256, activation='relu'),
+        tf.keras.layers.Dense(256, activation='relu'),
+        tf.keras.layers.Dense(128, activation='relu'),
+        tf.keras.layers.Dense(len(ACTIONS), activation='linear')
+    ])
+    model.compile(optimizer=tf.keras.optimizers.Adam(LEARNING_RATE), loss='mse')
+    return model
+
+model = build_model()
+target_model = build_model()
+target_model.set_weights(model.get_weights())
+
+# Get state representation
+def get_state(player_x, player_y, player_angle, player_velocity, sensors):
+    return np.array([
+        player_x / WIDTH, player_y / HEIGHT,
+        player_angle / 360, player_velocity / 10,
+        *[s / SENSOR_LENGTH for s in sensors]
+    ])
+
+# Choose action using ε-greedy policy
 def choose_action(state):
     if random.uniform(0, 1) < EXPLORATION_RATE:
         return random.choice(list(ACTIONS.keys()))
-    else:
-        return np.argmax(q_table[state])
+    q_values = model.predict(np.array([state]), verbose=0)
+    return np.argmax(q_values[0])
 
-def get_reward(collision, finished, player_velocity):
+# Reward function
+def get_reward(collision, finished, velocity, out_of_bounds):
+    if out_of_bounds:
+        return -200  # Big penalty for leaving the maze
     if collision:
-        return -100
-    elif finished:
-        return 100
-    else:
-        return player_velocity * 0.1
+        return -100  # Hitting a wall
+    if finished:
+        return 500  # Huge reward for finishing
+    return velocity * 0.3  # Encourage movement
 
-def reset_game():
-    player_x = 200
-    player_y = 500
-    player_angle = 90
-    player_velocity = 0
-    return player_x, player_y, player_angle, player_velocity
-
-def check_sensor(sensor_x, sensor_y):
-    # Check if the sensor detects a collision (black pixel)
-    if 0 <= sensor_x < MAP_WIDTH and 0 <= sensor_y < MAP_HEIGHT:
-        return map1.get_at((int(sensor_x), int(sensor_y))) == BLACK
-    return False
-
+# Sensor function
 def get_sensors(player_x, player_y, player_angle):
-    sensors = []
-    angles = [-45, 0, 45]  # Sensors at -45, 0, 45 degrees relative to car angle
-
-    for angle_offset in angles:
+    sensor_readings = []
+    for angle_offset in SENSOR_ANGLES:
         sensor_angle = math.radians(player_angle + angle_offset)
-        sensor_x = player_x + SENSOR_LENGTH * math.cos(sensor_angle)
-        sensor_y = player_y - SENSOR_LENGTH * math.sin(sensor_angle)
-        collision = check_sensor(sensor_x, sensor_y)
-        sensors.append(((sensor_x, sensor_y), collision))
+        for length in range(0, SENSOR_LENGTH, 5):
+            sensor_x = int(player_x + length * math.cos(sensor_angle))
+            sensor_y = int(player_y - length * math.sin(sensor_angle))
+            if 0 <= sensor_x < WIDTH and 0 <= sensor_y < HEIGHT:
+                if maze[int(sensor_x // GRID_SIZE), int(sensor_y // GRID_SIZE)] == 1:
+                    sensor_readings.append(length)
+                    break
+        else:
+            sensor_readings.append(SENSOR_LENGTH)
+    return sensor_readings
 
-    return sensors
+# Draw the car as a triangle
+def draw_car(player_x, player_y, player_angle):
+    car_length = 10
+    car_width = 6
 
-def draw_sensors(sensors):
-    for sensor, collision in sensors:
-        color = RED if collision else GREEN
-        pygame.draw.line(screen, color, player_rect.center, sensor, 2)
+    angle_rad = math.radians(player_angle)
+    front = (player_x + car_length * math.cos(angle_rad), player_y - car_length * math.sin(angle_rad))
+    left = (player_x + car_width * math.cos(angle_rad + math.pi * 2 / 3), player_y - car_width * math.sin(angle_rad + math.pi * 2 / 3))
+    right = (player_x + car_width * math.cos(angle_rad - math.pi * 2 / 3), player_y - car_width * math.sin(angle_rad - math.pi * 2 / 3))
 
+    pygame.draw.polygon(screen, BLUE, [front, left, right])
+
+# Training function
+def update_model():
+    if len(memory) < BATCH_SIZE:
+        return
+    batch = random.sample(memory, BATCH_SIZE)
+    states, actions, rewards, next_states, dones = zip(*batch)
+
+    states = np.array(states)
+    next_states = np.array(next_states)
+
+    q_values = model.predict(states, verbose=0)
+    next_q_values = target_model.predict(next_states, verbose=0)
+
+    for i in range(BATCH_SIZE):
+        target = rewards[i]
+        if not dones[i]:
+            target += DISCOUNT_FACTOR * np.max(next_q_values[i])
+        q_values[i][actions[i]] = target
+
+    model.fit(states, q_values, epochs=1, verbose=0, batch_size=BATCH_SIZE)
+
+# Main game loop
 def main():
     global EXPLORATION_RATE
     clock = pygame.time.Clock()
-    
-    total_episodes = 10000
-    for episode in range(total_episodes):
-        player_x, player_y, player_angle, player_velocity = reset_game()
+
+    for episode in range(5000):
+        player_x, player_y, player_angle, player_velocity = 20, 20, 90, 0
         done = False
-        
-        state = get_state(player_x, player_y, player_angle, player_velocity)
-        episode_reward = 0
-        
+        sensors = get_sensors(player_x, player_y, player_angle)
+        state = get_state(player_x, player_y, player_angle, player_velocity, sensors)
+
         while not done:
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    pygame.quit()
-                    sys.exit()
-            
             action = choose_action(state)
-            
-            if action == 0:  # accelerate
+
+            if action == 0:
                 player_velocity += ACCELERATION
-            elif action == 1:  # brake
+            elif action == 1:
                 player_velocity -= ACCELERATION
-            elif action == 2:  # turn left
+            elif action == 2:
                 player_angle += ROTATE_SPEED
-            elif action == 3:  # turn right
+            elif action == 3:
                 player_angle -= ROTATE_SPEED
-            
-            player_velocity *= (1 - FRICTION)
-            
-            player_dx = math.cos(math.radians(player_angle)) * player_velocity
-            player_dy = math.sin(math.radians(player_angle)) * player_velocity
-            
-            player_x += player_dx
-            player_y -= player_dy
-            
-            if player_x < 0:
-                player_x = 0
-            if player_x > WIDTH:
-                player_x = WIDTH
-            if player_y < 0:
-                player_y = 0
-            if player_y > HEIGHT:
-                player_y = HEIGHT
 
-            rotated_car = pygame.transform.rotate(player_car, player_angle)
-            rotated_rect = rotated_car.get_rect(center=(player_x, player_y))
-            rotated_car_mask = pygame.mask.from_surface(rotated_car)
-            offset = (rotated_rect.left - map1_rect.left, rotated_rect.top - map1_rect.top)
-            
-            try:
-                collision_point = map_mask.overlap(rotated_car_mask, offset)
-            except Exception as e:
-                print(f"Error calculating collision: {e}")
-                collision_point = None
-            
-            finished = rotated_rect.colliderect(finish_line)
-            collision = bool(collision_point)
-            
-            reward = get_reward(collision, finished, player_velocity)
-            episode_reward += reward
-            
-            next_state = get_state(player_x, player_y, player_angle, player_velocity)
-            
-            old_value = q_table[state + (action,)]
-            next_max = np.max(q_table[next_state])
-            
-            new_value = old_value + LEARNING_RATE * (reward + DISCOUNT_FACTOR * next_max - old_value)
-            q_table[state + (action,)] = new_value
-            
-            state = next_state
-            
-            if collision or finished:
-                done = True
+            new_x = player_x + math.cos(math.radians(player_angle)) * player_velocity
+            new_y = player_y - math.sin(math.radians(player_angle)) * player_velocity
 
-            # Get and draw sensors
-            sensors = get_sensors(player_x, player_y, player_angle)
-            
+            out_of_bounds = new_x < 0 or new_x >= WIDTH or new_y < 0 or new_y >= HEIGHT
+            collision = not out_of_bounds and maze[int(new_x // GRID_SIZE), int(new_y // GRID_SIZE)] == 1
+            finished = not out_of_bounds and (int(new_x // GRID_SIZE), int(new_y // GRID_SIZE)) == (rows - 2, cols - 2)
+
+            if collision or out_of_bounds:
+                done = True  # Reset on collision
+            else:
+                player_x, player_y = new_x, new_y
+
+            reward = get_reward(collision, finished, player_velocity, out_of_bounds)
+            memory.append((state, action, reward, get_state(player_x, player_y, player_angle, player_velocity, sensors), done))
+            update_model()
+            state = get_state(player_x, player_y, player_angle, player_velocity, sensors)
+
             screen.fill(WHITE)
-            screen.blit(map1, map1_rect.topleft)
-            pygame.draw.rect(screen, RED, finish_line)
-            screen.blit(rotated_car, rotated_rect.topleft)
-            draw_sensors(sensors)
+            draw_car(player_x, player_y, player_angle)
             pygame.display.flip()
-            
-            clock.tick(FPS)
-        
-        EXPLORATION_RATE = max(MIN_EXPLORATION_RATE, EXPLORATION_RATE * EXPLORATION_DECAY)
-        
-        if episode % 100 == 0:
-            print(f"Episode: {episode}, Total Reward: {episode_reward:.2f}, Exploration Rate: {EXPLORATION_RATE:.4f}")
-    
-    pygame.quit()
-    sys.exit()
+            clock.tick(60)
 
 if __name__ == "__main__":
     main()
